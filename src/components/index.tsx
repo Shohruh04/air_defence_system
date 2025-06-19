@@ -68,6 +68,9 @@ interface Threat {
     predictedPoints: { x: number; y: number; t: number }[];
     accuracy: number;
   };
+  // Для автозащиты
+  distanceToProtectedZone?: number;
+  threatenedZone?: string;
 }
 
 interface Alert {
@@ -194,6 +197,13 @@ const AirDefenseSimulation = () => {
   const [defenseMode, setDefenseMode] = useState<
     "DEFENSIVE" | "AGGRESSIVE" | "ADAPTIVE" | "AI_AUTONOMOUS"
   >("AI_AUTONOMOUS");
+  const [manualMode, setManualMode] = useState(false);
+  const [targetPoint, setTargetPoint] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+  const [autoDefenseEnabled, setAutoDefenseEnabled] = useState(true);
+  const [autoDefenseRadius, setAutoDefenseRadius] = useState(100);
 
   const addAlert = useCallback(
     (type: Alert["type"], message: string, severity: Alert["severity"]) => {
@@ -226,6 +236,37 @@ const AirDefenseSimulation = () => {
   const FRAME_TIME = 1000 / TARGET_FPS;
   const MAX_ALERTS = 5;
   const INTERCEPTION_DISTANCE = 15;
+
+  // Защищенные зоны для автоматической защиты
+  const protectedZones = useMemo(
+    () => [
+      {
+        x: RADAR_CENTER_X,
+        y: RADAR_CENTER_Y,
+        radius: 50,
+        priority: 1,
+        name: "Командный центр",
+        color: "#ff0000",
+      },
+      {
+        x: RADAR_CENTER_X - 80,
+        y: RADAR_CENTER_Y + 60,
+        radius: 30,
+        priority: 2,
+        name: "База ПВО",
+        color: "#ff6600",
+      },
+      {
+        x: RADAR_CENTER_X + 80,
+        y: RADAR_CENTER_Y - 60,
+        radius: 25,
+        priority: 3,
+        name: "Радарная установка",
+        color: "#ffaa00",
+      },
+    ],
+    [RADAR_CENTER_X, RADAR_CENTER_Y]
+  );
 
   const THREAT_TYPES: Record<string, ThreatConfig> = {
     DRONE: {
@@ -751,6 +792,7 @@ const AirDefenseSimulation = () => {
     systemMetrics.modelTrainingCount,
     addAlert,
   ]);
+
   const classifyThreat = useCallback(
     (
       threat: Threat
@@ -1004,6 +1046,87 @@ const AirDefenseSimulation = () => {
     },
     [calculateInterceptionPoint]
   );
+
+  const launchManualInterceptor = useCallback(
+    (targetX: number, targetY: number): Interceptor => {
+      const dx = targetX - RADAR_CENTER_X;
+      const dy = targetY - RADAR_CENTER_Y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      const speed = 6;
+
+      // Находим ближайшую угрозу к целевой точке для расчета успешности
+      let successProbability = 0.7; // Базовая вероятность
+      const nearestThreat = detectedThreats
+        .filter((t) => t.detected && !t.destroyed)
+        .reduce((nearest, threat) => {
+          const threatDist = Math.sqrt(
+            Math.pow(threat.x - targetX, 2) + Math.pow(threat.y - targetY, 2)
+          );
+          return !nearest || threatDist < nearest.distance
+            ? { threat, distance: threatDist }
+            : nearest;
+        }, null as { threat: Threat; distance: number } | null);
+
+      if (nearestThreat && nearestThreat.distance < 50) {
+        successProbability = Math.max(0.4, 0.9 - nearestThreat.distance / 100);
+      }
+
+      return {
+        id: Date.now() + Math.random(),
+        x: RADAR_CENTER_X,
+        y: RADAR_CENTER_Y,
+        vx: (dx / distance) * speed,
+        vy: (dy / distance) * speed,
+        target: nearestThreat?.threat.id || -1,
+        targetX,
+        targetY,
+        launched: true,
+        successProbability,
+        fuel: 100,
+        status: "LAUNCHED",
+      };
+    },
+    [detectedThreats]
+  );
+
+  const handleCanvasClick = useCallback(
+    (event: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!manualMode || !canvasRef.current) return;
+
+      const canvas = canvasRef.current;
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = CANVAS_WIDTH / rect.width;
+      const scaleY = CANVAS_HEIGHT / rect.height;
+
+      const clickX = (event.clientX - rect.left) * scaleX;
+      const clickY = (event.clientY - rect.top) * scaleY;
+
+      // Проверяем, что клик в пределах радара
+      const distanceFromCenter = Math.sqrt(
+        Math.pow(clickX - RADAR_CENTER_X, 2) +
+          Math.pow(clickY - RADAR_CENTER_Y, 2)
+      );
+
+      if (distanceFromCenter <= RADAR_RADIUS) {
+        setTargetPoint({ x: clickX, y: clickY });
+
+        const interceptor = launchManualInterceptor(clickX, clickY);
+        setInterceptors((prev) => [...prev, interceptor]);
+
+        addAlert(
+          "INTERCEPTION",
+          `Ручной запуск перехватчика на координаты (${Math.round(
+            clickX
+          )}, ${Math.round(clickY)})`,
+          "MEDIUM"
+        );
+
+        // Убираем точку цели через 3 секунды
+        setTimeout(() => setTargetPoint(null), 3000);
+      }
+    },
+    [manualMode, launchManualInterceptor, addAlert]
+  );
   const detectThreats = useCallback(
     (threats: Threat[], radarAngle: number): Threat[] => {
       const detectionRange = RADAR_RADIUS * radarSensitivity;
@@ -1178,6 +1301,120 @@ const AirDefenseSimulation = () => {
       return updatedInterceptors;
     });
   }, [createExplosion, addAlert]);
+
+  // Функция проверки угроз для защищенных зон
+  const checkAutoDefense = useCallback(
+    (threats: Threat[]): Threat[] => {
+      if (!autoDefenseEnabled) return [];
+
+      const threateningTargets: Threat[] = [];
+
+      threats.forEach((threat) => {
+        if (!threat.detected || threat.destroyed || threat.intercepted) return;
+
+        protectedZones.forEach((zone) => {
+          const distanceToZone = Math.sqrt(
+            Math.pow(threat.x - zone.x, 2) + Math.pow(threat.y - zone.y, 2)
+          );
+
+          // Предсказываем траекторию угрозы (упрощенная версия)
+          let willIntersect = false;
+          let px = threat.x;
+          let py = threat.y;
+          const vx = threat.vx;
+          const vy = threat.vy;
+
+          // Проверяем пересечение на следующих 20 шагах
+          for (let step = 0; step < 20; step++) {
+            px += vx;
+            py += vy;
+
+            const distToZone = Math.sqrt(
+              Math.pow(px - zone.x, 2) + Math.pow(py - zone.y, 2)
+            );
+
+            if (distToZone <= zone.radius + autoDefenseRadius) {
+              willIntersect = true;
+              break;
+            }
+          }
+
+          if (willIntersect || distanceToZone <= autoDefenseRadius) {
+            // Добавляем приоритет на основе зоны
+            const threatWithPriority = {
+              ...threat,
+              priority: (threat.priority || 0) + zone.priority * 10,
+              distanceToProtectedZone: distanceToZone,
+              threatenedZone: zone.name,
+            };
+
+            if (!threateningTargets.find((t) => t.id === threat.id)) {
+              threateningTargets.push(threatWithPriority);
+            }
+          }
+        });
+      });
+
+      return threateningTargets.sort(
+        (a, b) => (b.priority || 0) - (a.priority || 0)
+      );
+    },
+    [autoDefenseEnabled, autoDefenseRadius, protectedZones]
+  );
+
+  // Функция автоматического запуска защитных перехватчиков
+  const launchAutoDefenseInterceptors = useCallback(
+    (threats: Threat[]) => {
+      if (!autoDefenseEnabled) return;
+
+      const maxAutoInterceptors = 3;
+      const activeInterceptors = interceptors.filter(
+        (i) => i.status === "LAUNCHED" || i.status === "TRACKING"
+      ).length;
+
+      if (activeInterceptors >= maxAutoInterceptors) return;
+
+      const threateningTargets = checkAutoDefense(threats);
+      const launchCount = Math.min(
+        threateningTargets.length,
+        maxAutoInterceptors - activeInterceptors
+      );
+
+      for (let i = 0; i < launchCount; i++) {
+        const threat = threateningTargets[i];
+
+        // Проверяем, нет ли уже перехватчика для этой угрозы
+        const hasInterceptor = interceptors.some(
+          (int) => int.target === threat.id
+        );
+        if (hasInterceptor) continue;
+
+        const interceptor = launchInterceptor(threat);
+        if (interceptor) {
+          setInterceptors((prev) => [...prev, interceptor]);
+          setDetectedThreats((prev) =>
+            prev.map((t) =>
+              t.id === threat.id ? { ...t, intercepted: true } : t
+            )
+          );
+
+          addAlert(
+            "INTERCEPTION",
+            `АВТОЗАЩИТА: Перехватчик запущен для защиты зоны "${threat.threatenedZone}"`,
+            threat.threatLevel || "HIGH"
+          );
+        }
+      }
+    },
+    [
+      autoDefenseEnabled,
+      interceptors,
+      checkAutoDefense,
+      launchInterceptor,
+      addAlert,
+    ]
+  );
+
   const updateSimulation = useCallback(() => {
     const currentTime = performance.now();
     if (currentTime - lastUpdateTime.current < FRAME_TIME) {
@@ -1275,6 +1512,11 @@ const AirDefenseSimulation = () => {
         return true;
       });
       threats = detectThreats(threats, radarSweep);
+
+      // Автозащита защищенных зон
+      if (autoDefenseEnabled) {
+        launchAutoDefenseInterceptors(threats);
+      }
 
       return threats;
     });
@@ -1721,14 +1963,89 @@ const AirDefenseSimulation = () => {
     ctx.beginPath();
     ctx.arc(RADAR_CENTER_X, RADAR_CENTER_Y, 10, 0, 2 * Math.PI);
     ctx.stroke();
+
+    // Отображение защищенных зон
+    if (autoDefenseEnabled) {
+      protectedZones.forEach((zone) => {
+        // Зона объекта
+        ctx.strokeStyle = zone.color + "80";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.arc(zone.x, zone.y, zone.radius, 0, 2 * Math.PI);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Зона автозащиты
+        ctx.strokeStyle = zone.color + "40";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 4]);
+        ctx.beginPath();
+        ctx.arc(
+          zone.x,
+          zone.y,
+          zone.radius + autoDefenseRadius,
+          0,
+          2 * Math.PI
+        );
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Центр зоны
+        ctx.fillStyle = zone.color;
+        ctx.beginPath();
+        ctx.arc(zone.x, zone.y, 4, 0, 2 * Math.PI);
+        ctx.fill();
+
+        // Название зоны
+        ctx.fillStyle = zone.color;
+        ctx.font = "8px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(zone.name, zone.x, zone.y - zone.radius - 8);
+        ctx.textAlign = "left";
+      });
+    }
+
+    // Отображение целевой точки ручного запуска
+    if (targetPoint && manualMode) {
+      ctx.strokeStyle = "#ff6600";
+      ctx.lineWidth = 3;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.arc(targetPoint.x, targetPoint.y, 15, 0, 2 * Math.PI);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Крестик в центре целевой точки
+      ctx.strokeStyle = "#ff6600";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(targetPoint.x - 8, targetPoint.y);
+      ctx.lineTo(targetPoint.x + 8, targetPoint.y);
+      ctx.moveTo(targetPoint.x, targetPoint.y - 8);
+      ctx.lineTo(targetPoint.x, targetPoint.y + 8);
+      ctx.stroke();
+
+      // Текст "ЦЕЛЬ"
+      ctx.fillStyle = "#ff6600";
+      ctx.font = "bold 10px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("ЦЕЛЬ", targetPoint.x, targetPoint.y - 20);
+      ctx.textAlign = "left";
+    }
   }, [
     detectedThreats,
     interceptors,
     radarSweep,
-    predictTrajectory,
     threatStats,
     radarSensitivity,
     isRunning,
+    targetPoint,
+    manualMode,
+    autoDefenseEnabled,
+    protectedZones,
+    autoDefenseRadius,
+    explosions,
   ]);
 
   const resetSimulation = () => {
@@ -1847,6 +2164,26 @@ const AirDefenseSimulation = () => {
                   AI: {aiEnabled ? "ON" : "OFF"}
                 </button>
                 <button
+                  onClick={() => setManualMode(!manualMode)}
+                  className={`px-3 py-1 rounded text-sm transition-colors ${
+                    manualMode
+                      ? "bg-orange-600 hover:bg-orange-700 text-white"
+                      : "bg-gray-600 hover:bg-gray-700 text-gray-300"
+                  }`}
+                >
+                  Ручной: {manualMode ? "ON" : "OFF"}
+                </button>
+                <button
+                  onClick={() => setAutoDefenseEnabled(!autoDefenseEnabled)}
+                  className={`px-3 py-1 rounded text-sm transition-colors ${
+                    autoDefenseEnabled
+                      ? "bg-blue-600 hover:bg-blue-700 text-white"
+                      : "bg-gray-600 hover:bg-gray-700 text-gray-300"
+                  }`}
+                >
+                  Авто: {autoDefenseEnabled ? "ON" : "OFF"}
+                </button>
+                <button
                   onClick={trainAIModels}
                   disabled={
                     !aiEnabled || trainingData.threatFeatures.length < 5
@@ -1888,16 +2225,19 @@ const AirDefenseSimulation = () => {
                 ref={canvasRef}
                 width={CANVAS_WIDTH}
                 height={CANVAS_HEIGHT}
-                className="w-full h-full object-contain"
+                className={`w-full h-full object-contain ${
+                  manualMode ? "cursor-crosshair" : "cursor-default"
+                }`}
                 style={{
                   display: "block",
                   imageRendering: "crisp-edges",
                 }}
+                onClick={handleCanvasClick}
               />
             </div>
 
             {/* Radar Controls */}
-            <div className="mt-4 grid grid-cols-3 gap-4 text-sm">
+            <div className="mt-4 grid grid-cols-4 gap-4 text-sm">
               <div>
                 <label className="block text-gray-400 mb-1">
                   Radar Sensitivity
@@ -1917,6 +2257,26 @@ const AirDefenseSimulation = () => {
                   {Math.round(radarSensitivity * 100)}%
                 </span>
               </div>
+              <div>
+                <label className="block text-gray-400 mb-1">
+                  Defense Radius
+                </label>
+                <input
+                  type="range"
+                  min="30"
+                  max="150"
+                  step="10"
+                  value={autoDefenseRadius}
+                  onChange={(e) =>
+                    setAutoDefenseRadius(parseInt(e.target.value))
+                  }
+                  className="w-full"
+                  disabled={!autoDefenseEnabled}
+                />
+                <span className="text-xs text-gray-500">
+                  {autoDefenseRadius}м
+                </span>
+              </div>
               <div className="text-center">
                 <div className="text-gray-400 mb-1">Defense Mode</div>
                 <div
@@ -1932,6 +2292,11 @@ const AirDefenseSimulation = () => {
                 >
                   {defenseMode}
                 </div>
+                {manualMode && (
+                  <div className="text-orange-400 text-sm mt-1">
+                    РУЧНОЙ РЕЖИМ
+                  </div>
+                )}
               </div>
               <div className="text-right">
                 <div className="text-gray-400 mb-1">System Uptime</div>
@@ -2170,6 +2535,14 @@ const AirDefenseSimulation = () => {
                 <div className="w-3 h-3 bg-red-400 rounded-full flex-shrink-0"></div>
                 <span>Miss/Explosion</span>
               </div>
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 border-2 border-orange-500 rounded-full flex-shrink-0"></div>
+                <span>Manual Target</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 border-2 border-red-500 border-dashed rounded-full flex-shrink-0"></div>
+                <span>Protected Zones</span>
+              </div>
               <div className="mt-3 pt-2 border-t border-gray-600 text-xs text-gray-400">
                 <div>Defense Modes:</div>
                 <div className="mt-1 space-y-1">
@@ -2186,6 +2559,22 @@ const AirDefenseSimulation = () => {
                     interception
                   </div>
                 </div>
+                {autoDefenseEnabled && (
+                  <div className="mt-2 pt-2 border-t border-gray-600 text-xs text-blue-400">
+                    <div className="font-bold">Автозащита активна</div>
+                    <div className="text-gray-400 mt-1">
+                      Радиус защиты: {autoDefenseRadius}м
+                    </div>
+                  </div>
+                )}
+                {manualMode && (
+                  <div className="mt-2 pt-2 border-t border-gray-600 text-xs text-orange-400">
+                    <div className="font-bold">Ручной режим активен</div>
+                    <div className="text-gray-400 mt-1">
+                      Кликните на радаре для запуска перехватчика
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
