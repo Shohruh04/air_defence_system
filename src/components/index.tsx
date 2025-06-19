@@ -6,6 +6,7 @@ import React, {
   useCallback,
   useMemo,
 } from "react";
+import * as tf from "@tensorflow/tfjs";
 import {
   Radar,
   Target,
@@ -18,8 +19,20 @@ import {
   Activity,
   TrendingUp,
 } from "lucide-react";
+interface AIModels {
+  threatClassifier: tf.LayersModel | null;
+  trajectoryPredictor: tf.LayersModel | null;
+  decisionMaker: tf.LayersModel | null;
+}
 
-// Enhanced interfaces for advanced features
+interface TrainingData {
+  threatFeatures: number[][];
+  threatLabels: number[][];
+  trajectoryData: number[][];
+  trajectoryTargets: number[][];
+  decisionFeatures: number[][];
+  decisionTargets: number[][];
+}
 interface Threat {
   id: number;
   x: number;
@@ -44,6 +57,15 @@ interface Threat {
   estimatedImpactTime?: number;
   destroyedAt?: number;
   missedTarget?: boolean;
+  aiClassification?: {
+    confidence: number;
+    probabilities: { [key: string]: number };
+    anomalyScore: number;
+  };
+  aiTrajectory?: {
+    predictedPoints: { x: number; y: number; t: number }[];
+    accuracy: number;
+  };
 }
 
 interface Alert {
@@ -54,7 +76,8 @@ interface Alert {
     | "INTERCEPTION"
     | "SYSTEM"
     | "TARGET_DESTROYED"
-    | "TARGET_MISSED";
+    | "TARGET_MISSED"
+    | "AI_ALERT";
   message: string;
   severity: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
   timestamp: number;
@@ -75,6 +98,11 @@ interface Interceptor {
   fuel?: number;
   status?: "READY" | "LAUNCHED" | "TRACKING" | "IMPACT" | "DESTROYED";
   hasHitTarget?: boolean;
+  aiDecision?: {
+    confidence: number;
+    reasoning: string;
+    optimalLaunchTime: number;
+  };
 }
 
 interface TrajectoryPoint {
@@ -108,6 +136,8 @@ interface SystemMetrics {
   averageResponseTime: number;
   destroyedThreats: number;
   escapedThreats: number;
+  aiAccuracy: number;
+  modelTrainingCount: number;
 }
 
 interface Explosion {
@@ -132,6 +162,20 @@ const AirDefenseSimulation = () => {
   const [radarSweep, setRadarSweep] = useState(0);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [explosions, setExplosions] = useState<Explosion[]>([]);
+  const [aiModels, setAiModels] = useState<AIModels>({
+    threatClassifier: null,
+    trajectoryPredictor: null,
+    decisionMaker: null,
+  });
+  const [trainingData, setTrainingData] = useState<TrainingData>({
+    threatFeatures: [],
+    threatLabels: [],
+    trajectoryData: [],
+    trajectoryTargets: [],
+    decisionFeatures: [],
+    decisionTargets: [],
+  });
+  const [aiEnabled, setAiEnabled] = useState(true);
   const [systemMetrics, setSystemMetrics] = useState<SystemMetrics>({
     threatsDetected: 0,
     successfulInterceptions: 0,
@@ -141,13 +185,34 @@ const AirDefenseSimulation = () => {
     averageResponseTime: 0,
     destroyedThreats: 0,
     escapedThreats: 0,
+    aiAccuracy: 0,
+    modelTrainingCount: 0,
   });
   const [radarSensitivity, setRadarSensitivity] = useState(0.8);
   const [defenseMode, setDefenseMode] = useState<
-    "DEFENSIVE" | "AGGRESSIVE" | "ADAPTIVE"
-  >("ADAPTIVE");
+    "DEFENSIVE" | "AGGRESSIVE" | "ADAPTIVE" | "AI_AUTONOMOUS"
+  >("AI_AUTONOMOUS");
 
-  // Enhanced simulation parameters
+  const addAlert = useCallback(
+    (type: Alert["type"], message: string, severity: Alert["severity"]) => {
+      const newAlert: Alert = {
+        id: Date.now() + Math.random(),
+        type,
+        message,
+        severity,
+        timestamp: Date.now(),
+        duration:
+          severity === "CRITICAL" ? 8000 : severity === "HIGH" ? 5000 : 3000,
+      };
+
+      setAlerts((prev) => {
+        const updated = [newAlert, ...prev.slice(0, MAX_ALERTS - 1)];
+        return updated;
+      });
+    },
+    []
+  );
+
   const CANVAS_WIDTH = 800;
   const CANVAS_HEIGHT = 600;
   const RADAR_CENTER_X = CANVAS_WIDTH / 2;
@@ -158,9 +223,8 @@ const AirDefenseSimulation = () => {
   const TARGET_FPS = 60;
   const FRAME_TIME = 1000 / TARGET_FPS;
   const MAX_ALERTS = 5;
-  const INTERCEPTION_DISTANCE = 15; // Distance for successful interception
+  const INTERCEPTION_DISTANCE = 15;
 
-  // Enhanced threat types with AI characteristics
   const THREAT_TYPES: Record<string, ThreatConfig> = {
     DRONE: {
       speed: 2,
@@ -206,28 +270,485 @@ const AirDefenseSimulation = () => {
     },
   };
 
-  // Add alert function
-  const addAlert = useCallback(
-    (type: Alert["type"], message: string, severity: Alert["severity"]) => {
-      const newAlert: Alert = {
-        id: Date.now() + Math.random(),
-        type,
-        message,
-        severity,
-        timestamp: Date.now(),
-        duration:
-          severity === "CRITICAL" ? 8000 : severity === "HIGH" ? 5000 : 3000,
-      };
-
-      setAlerts((prev) => {
-        const updated = [newAlert, ...prev.slice(0, MAX_ALERTS - 1)];
-        return updated;
+  const initializeAIModels = useCallback(async () => {
+    try {
+      const threatClassifier = tf.sequential({
+        layers: [
+          tf.layers.dense({ inputShape: [8], units: 32, activation: "relu" }),
+          tf.layers.dropout({ rate: 0.2 }),
+          tf.layers.dense({ units: 16, activation: "relu" }),
+          tf.layers.dropout({ rate: 0.1 }),
+          tf.layers.dense({ units: 6, activation: "softmax" }),
+        ],
       });
-    },
-    []
-  );
 
-  // Enhanced AI-based threat classification with confidence
+      threatClassifier.compile({
+        optimizer: tf.train.adam(0.001),
+        loss: "categoricalCrossentropy",
+        metrics: ["accuracy"],
+      });
+
+      const trajectoryPredictor = tf.sequential({
+        layers: [
+          tf.layers.dense({ inputShape: [10], units: 64, activation: "relu" }),
+          tf.layers.dropout({ rate: 0.2 }),
+          tf.layers.dense({ units: 32, activation: "relu" }),
+          tf.layers.dense({ units: 16, activation: "relu" }),
+          tf.layers.dense({ units: 4, activation: "linear" }),
+        ],
+      });
+
+      trajectoryPredictor.compile({
+        optimizer: tf.train.adam(0.001),
+        loss: "meanSquaredError",
+        metrics: ["mae"],
+      });
+
+      const decisionMaker = tf.sequential({
+        layers: [
+          tf.layers.dense({ inputShape: [12], units: 48, activation: "relu" }),
+          tf.layers.dropout({ rate: 0.3 }),
+          tf.layers.dense({ units: 24, activation: "relu" }),
+          tf.layers.dropout({ rate: 0.2 }),
+          tf.layers.dense({ units: 12, activation: "relu" }),
+          tf.layers.dense({ units: 3, activation: "softmax" }),
+        ],
+      });
+
+      decisionMaker.compile({
+        optimizer: tf.train.adam(0.001),
+        loss: "categoricalCrossentropy",
+        metrics: ["accuracy"],
+      });
+
+      setAiModels({
+        threatClassifier,
+        trajectoryPredictor,
+        decisionMaker,
+      });
+
+      addAlert(
+        "AI_ALERT",
+        "AI models initialized successfully - Neural networks online",
+        "MEDIUM"
+      );
+    } catch (error) {
+      console.error("Failed to initialize AI models:", error);
+      addAlert(
+        "AI_ALERT",
+        "AI model initialization failed - Falling back to traditional methods",
+        "HIGH"
+      );
+    }
+  }, []);
+
+  useEffect(() => {
+    initializeAIModels();
+  }, [initializeAIModels]);
+
+  const extractThreatFeatures = useCallback((threat: Threat): number[] => {
+    const distanceFromCenter = Math.sqrt(
+      Math.pow(threat.x - RADAR_CENTER_X, 2) +
+        Math.pow(threat.y - RADAR_CENTER_Y, 2)
+    );
+    const speed = Math.sqrt(threat.vx * threat.vx + threat.vy * threat.vy);
+    const direction = Math.atan2(threat.vy, threat.vx);
+    const approachAngle = Math.atan2(
+      RADAR_CENTER_Y - threat.y,
+      RADAR_CENTER_X - threat.x
+    );
+
+    return [
+      threat.size / 10,
+      speed / 6,
+      distanceFromCenter / RADAR_RADIUS,
+      direction / (2 * Math.PI),
+      approachAngle / (2 * Math.PI),
+      threat.age / 100,
+      threat.confidence || 0.5,
+      Math.abs(direction - approachAngle) / Math.PI,
+    ];
+  }, []);
+  const classifyThreatWithAI = useCallback(
+    async (
+      threat: Threat
+    ): Promise<{
+      type: string;
+      confidence: number;
+      threatLevel: Threat["threatLevel"];
+      aiClassification: Threat["aiClassification"];
+    }> => {
+      if (!aiModels.threatClassifier || !aiEnabled) {
+        const speed = Math.sqrt(threat.vx * threat.vx + threat.vy * threat.vy);
+        const size = threat.size;
+
+        let type = "UNKNOWN";
+        let confidence = 0.5;
+        let threatLevel: Threat["threatLevel"] = "LOW";
+
+        if (speed > 4.5 && size > 5) {
+          type = "MISSILE";
+          confidence = 0.9;
+          threatLevel = "CRITICAL";
+        } else if (speed > 3.5 && size < 5) {
+          type = "STEALTH";
+          confidence = 0.6;
+          threatLevel = "HIGH";
+        } else if (speed < 2.5 && size < 5) {
+          type = Math.random() < 0.3 ? "SWARM" : "DRONE";
+          confidence = 0.8;
+          threatLevel = type === "SWARM" ? "MEDIUM" : "LOW";
+        } else if (size > 7) {
+          type = "AIRCRAFT";
+          confidence = 0.85;
+          threatLevel = "MEDIUM";
+        }
+
+        return {
+          type,
+          confidence,
+          threatLevel,
+          aiClassification: {
+            confidence: confidence,
+            probabilities: { [type]: confidence },
+            anomalyScore: 0.1,
+          },
+        };
+      }
+
+      try {
+        const features = extractThreatFeatures(threat);
+        const prediction = aiModels.threatClassifier.predict(
+          tf.tensor2d([features])
+        ) as tf.Tensor;
+        const probabilities = await prediction.data();
+        prediction.dispose();
+
+        const threatTypeLabels = [
+          "DRONE",
+          "MISSILE",
+          "AIRCRAFT",
+          "STEALTH",
+          "SWARM",
+          "UNKNOWN",
+        ];
+        const maxProbIndex = probabilities.indexOf(Math.max(...probabilities));
+        const type = threatTypeLabels[maxProbIndex];
+        const confidence = probabilities[maxProbIndex];
+        const entropy = -Array.from(probabilities).reduce(
+          (sum: number, p: number) => sum + (p > 0 ? p * Math.log(p) : 0),
+          0
+        );
+        const anomalyScore = entropy / Math.log(threatTypeLabels.length);
+
+        let threatLevel: Threat["threatLevel"] = "LOW";
+        if (type === "MISSILE" || confidence > 0.8) threatLevel = "CRITICAL";
+        else if (type === "STEALTH" || confidence > 0.6) threatLevel = "HIGH";
+        else if (type === "AIRCRAFT" || type === "SWARM")
+          threatLevel = "MEDIUM";
+
+        const aiClassification = {
+          confidence,
+          probabilities: Object.fromEntries(
+            threatTypeLabels.map((label, i) => [label, probabilities[i]])
+          ),
+          anomalyScore,
+        };
+        if (anomalyScore > 0.8) {
+          addAlert(
+            "AI_ALERT",
+            `Unusual threat pattern detected! Anomaly score: ${Math.round(
+              anomalyScore * 100
+            )}%`,
+            "HIGH"
+          );
+        }
+
+        return { type, confidence, threatLevel, aiClassification };
+      } catch (error) {
+        console.error("AI classification error:", error);
+
+        return classifyThreatWithAI(threat);
+      }
+    },
+    [aiModels.threatClassifier, aiEnabled, extractThreatFeatures, addAlert]
+  );
+  const predictTrajectoryWithAI = useCallback(
+    async (threat: Threat, steps = 15): Promise<TrajectoryPoint[]> => {
+      if (!aiModels.trajectoryPredictor || !aiEnabled) {
+        const trajectory: TrajectoryPoint[] = [];
+        let x = threat.x;
+        let y = threat.y;
+        let vx = threat.vx;
+        let vy = threat.vy;
+
+        for (let i = 0; i < steps; i++) {
+          x += vx;
+          y += vy;
+          vx += (Math.random() - 0.5) * 0.1;
+          vy += (Math.random() - 0.5) * 0.1;
+          trajectory.push({ x, y, t: i, confidence: 0.5 });
+        }
+        return trajectory;
+      }
+
+      try {
+        const trajectory: TrajectoryPoint[] = [];
+        let currentX = threat.x;
+        let currentY = threat.y;
+        let currentVx = threat.vx;
+        let currentVy = threat.vy;
+
+        for (let i = 0; i < steps; i++) {
+          const features = [
+            currentX / CANVAS_WIDTH,
+            currentY / CANVAS_HEIGHT,
+            currentVx / 6,
+            currentVy / 6,
+            threat.size / 10,
+            i / steps,
+            threat.confidence || 0.5,
+            Math.sqrt(currentVx * currentVx + currentVy * currentVy) / 6,
+            Math.atan2(currentVy, currentVx) / (2 * Math.PI),
+            Math.sqrt(
+              Math.pow(currentX - RADAR_CENTER_X, 2) +
+                Math.pow(currentY - RADAR_CENTER_Y, 2)
+            ) / RADAR_RADIUS,
+          ];
+
+          const prediction = aiModels.trajectoryPredictor.predict(
+            tf.tensor2d([features])
+          ) as tf.Tensor;
+          const result = await prediction.data();
+          prediction.dispose();
+
+          currentX = result[0] * CANVAS_WIDTH;
+          currentY = result[1] * CANVAS_HEIGHT;
+          currentVx = result[2] * 6;
+          currentVy = result[3] * 6;
+
+          const confidence = Math.max(0.1, 0.9 - i * 0.04);
+          trajectory.push({ x: currentX, y: currentY, t: i, confidence });
+        }
+
+        return trajectory;
+      } catch (error) {
+        console.error("AI trajectory prediction error:", error);
+        return predictTrajectoryWithAI(threat, steps);
+      }
+    },
+    [aiModels.trajectoryPredictor, aiEnabled]
+  );
+  const makeInterceptionDecisionWithAI = useCallback(
+    async (
+      threat: Threat,
+      interceptor: Partial<Interceptor>
+    ): Promise<{
+      decision: "LAUNCH" | "WAIT" | "ABORT";
+      confidence: number;
+      reasoning: string;
+    }> => {
+      if (!aiModels.decisionMaker || !aiEnabled) {
+        return {
+          decision: "LAUNCH",
+          confidence: 0.7,
+          reasoning: "Traditional algorithm decision",
+        };
+      }
+
+      try {
+        const distanceToThreat = Math.sqrt(
+          Math.pow(threat.x - RADAR_CENTER_X, 2) +
+            Math.pow(threat.y - RADAR_CENTER_Y, 2)
+        );
+        const threatSpeed = Math.sqrt(
+          threat.vx * threat.vx + threat.vy * threat.vy
+        );
+        const timeToImpact = distanceToThreat / threatSpeed;
+
+        const features = [
+          threat.size / 10,
+          threatSpeed / 6,
+          distanceToThreat / RADAR_RADIUS,
+          threat.confidence || 0.5,
+          (threat.priority || 1) / 4,
+          timeToImpact / 100,
+          interceptor.successProbability || 0.5,
+          (interceptor.fuel || 100) / 100,
+          interceptors.length / 5,
+          (threat.age || 0) / 100,
+          radarSensitivity,
+          defenseMode === "AGGRESSIVE"
+            ? 1
+            : defenseMode === "DEFENSIVE"
+            ? 0
+            : 0.5,
+        ];
+
+        const prediction = aiModels.decisionMaker.predict(
+          tf.tensor2d([features])
+        ) as tf.Tensor;
+        const probabilities = await prediction.data();
+        prediction.dispose();
+
+        const decisions = ["LAUNCH", "WAIT", "ABORT"] as const;
+        const maxProbIndex = probabilities.indexOf(Math.max(...probabilities));
+        const decision = decisions[maxProbIndex];
+        const confidence = probabilities[maxProbIndex];
+
+        let reasoning = "";
+        if (decision === "LAUNCH") {
+          reasoning = `High threat priority (${threat.threatLevel}), optimal interception window`;
+        } else if (decision === "WAIT") {
+          reasoning = `Monitoring threat movement, waiting for better opportunity`;
+        } else {
+          reasoning = `Low success probability or resource conservation needed`;
+        }
+
+        return { decision, confidence, reasoning };
+      } catch (error) {
+        console.error("AI decision making error:", error);
+        return {
+          decision: "LAUNCH",
+          confidence: 0.5,
+          reasoning: "AI error - fallback decision",
+        };
+      }
+    },
+    [
+      aiModels.decisionMaker,
+      aiEnabled,
+      interceptors.length,
+      radarSensitivity,
+      defenseMode,
+    ]
+  );
+  const collectTrainingData = useCallback(
+    (threat: Threat, interceptor: Interceptor, success: boolean) => {
+      if (!aiEnabled) return;
+      const threatFeatures = extractThreatFeatures(threat);
+      const threatTypeLabels = [
+        "DRONE",
+        "MISSILE",
+        "AIRCRAFT",
+        "STEALTH",
+        "SWARM",
+        "UNKNOWN",
+      ];
+      const threatLabel = new Array(6).fill(0);
+      const typeIndex = threatTypeLabels.indexOf(threat.type);
+      if (typeIndex !== -1) {
+        threatLabel[typeIndex] = 1;
+      }
+      const decisionFeatures = [
+        threat.size / 10,
+        Math.sqrt(threat.vx * threat.vx + threat.vy * threat.vy) / 6,
+        Math.sqrt(
+          Math.pow(threat.x - RADAR_CENTER_X, 2) +
+            Math.pow(threat.y - RADAR_CENTER_Y, 2)
+        ) / RADAR_RADIUS,
+        threat.confidence || 0.5,
+        (threat.priority || 1) / 4,
+        threat.age / 100,
+        interceptor.successProbability || 0.5,
+        (interceptor.fuel || 100) / 100,
+        interceptors.length / 5,
+        threat.age / 100,
+        radarSensitivity,
+        defenseMode === "AGGRESSIVE"
+          ? 1
+          : defenseMode === "DEFENSIVE"
+          ? 0
+          : 0.5,
+      ];
+
+      const decisionLabel = success ? [1, 0, 0] : [0, 0, 1];
+
+      setTrainingData((prev) => ({
+        ...prev,
+        threatFeatures: [...prev.threatFeatures, threatFeatures],
+        threatLabels: [...prev.threatLabels, threatLabel],
+        decisionFeatures: [...prev.decisionFeatures, decisionFeatures],
+        decisionTargets: [...prev.decisionTargets, decisionLabel],
+      }));
+    },
+    [
+      aiEnabled,
+      extractThreatFeatures,
+      interceptors.length,
+      radarSensitivity,
+      defenseMode,
+    ]
+  );
+  const trainAIModels = useCallback(async () => {
+    if (!aiEnabled || trainingData.threatFeatures.length < 10) return;
+
+    try {
+      if (aiModels.threatClassifier && trainingData.threatFeatures.length > 0) {
+        const xs = tf.tensor2d(trainingData.threatFeatures);
+        const ys = tf.tensor2d(trainingData.threatLabels);
+
+        await aiModels.threatClassifier.fit(xs, ys, {
+          epochs: 5,
+          batchSize: 8,
+          validationSplit: 0.2,
+          verbose: 0,
+        });
+
+        xs.dispose();
+        ys.dispose();
+      }
+      if (aiModels.decisionMaker && trainingData.decisionFeatures.length > 0) {
+        const xs = tf.tensor2d(trainingData.decisionFeatures);
+        const ys = tf.tensor2d(trainingData.decisionTargets);
+
+        await aiModels.decisionMaker.fit(xs, ys, {
+          epochs: 3,
+          batchSize: 4,
+          validationSplit: 0.2,
+          verbose: 0,
+        });
+
+        xs.dispose();
+        ys.dispose();
+      }
+
+      setSystemMetrics((prev) => ({
+        ...prev,
+        modelTrainingCount: prev.modelTrainingCount + 1,
+        aiAccuracy: Math.min(0.95, prev.aiAccuracy + 0.05),
+      }));
+
+      addAlert(
+        "AI_ALERT",
+        `AI models retrained! Training cycles: ${
+          systemMetrics.modelTrainingCount + 1
+        }`,
+        "MEDIUM"
+      );
+      setTrainingData({
+        threatFeatures: [],
+        threatLabels: [],
+        trajectoryData: [],
+        trajectoryTargets: [],
+        decisionFeatures: [],
+        decisionTargets: [],
+      });
+    } catch (error) {
+      console.error("AI training error:", error);
+      addAlert(
+        "AI_ALERT",
+        "AI model training failed - Models may need reinitialization",
+        "HIGH"
+      );
+    }
+  }, [
+    aiEnabled,
+    trainingData,
+    aiModels,
+    systemMetrics.modelTrainingCount,
+    addAlert,
+  ]);
   const classifyThreat = useCallback(
     (
       threat: Threat
@@ -246,8 +767,6 @@ const AirDefenseSimulation = () => {
       let type = "UNKNOWN";
       let confidence = 0.5;
       let threatLevel: Threat["threatLevel"] = "LOW";
-
-      // Enhanced classification logic
       if (speed > 4.5 && size > 5) {
         type = "MISSILE";
         confidence = 0.9;
@@ -265,8 +784,6 @@ const AirDefenseSimulation = () => {
         confidence = 0.85;
         threatLevel = "MEDIUM";
       }
-
-      // Adjust confidence based on distance and radar sensitivity
       confidence *=
         (1 - distanceFromCenter / (RADAR_RADIUS * 1.5)) * radarSensitivity;
       confidence = Math.max(0.1, Math.min(0.99, confidence));
@@ -275,8 +792,6 @@ const AirDefenseSimulation = () => {
     },
     [radarSensitivity]
   );
-
-  // Enhanced trajectory prediction with multiple algorithms
   const predictTrajectory = useCallback(
     (threat: Threat, steps = 15): TrajectoryPoint[] => {
       const trajectory: TrajectoryPoint[] = [];
@@ -284,32 +799,25 @@ const AirDefenseSimulation = () => {
       let y = threat.y;
       let vx = threat.vx;
       let vy = threat.vy;
-
-      // Calculate prediction accuracy based on threat age and type
       const basePredictionAccuracy =
         THREAT_TYPES[threat.type]?.detectability || 0.5;
-      const ageBonus = Math.min(threat.age / 50, 0.3); // Better prediction with more data
+      const ageBonus = Math.min(threat.age / 50, 0.3);
       const predictionAccuracy = Math.min(
         basePredictionAccuracy + ageBonus,
         0.95
       );
 
       for (let i = 0; i < steps; i++) {
-        // Adaptive prediction based on threat behavior
-        const adaptiveFactor = 1 + 0.1 * Math.sin(i * 0.2); // Slight trajectory variation
+        const adaptiveFactor = 1 + 0.1 * Math.sin(i * 0.2);
 
         x += vx * adaptiveFactor;
         y += vy * adaptiveFactor;
-
-        // Add uncertainty that decreases with prediction accuracy
         const uncertainty = (1 - predictionAccuracy) * 2;
         vx += (Math.random() - 0.5) * uncertainty;
         vy += (Math.random() - 0.5) * uncertainty;
-
-        // Simulate gravity and air resistance for missiles
         if (threat.type === "MISSILE") {
-          vy += 0.05; // slight gravity effect
-          vx *= 0.999; // minimal air resistance
+          vy += 0.05;
+          vx *= 0.999;
           vy *= 0.999;
         }
 
@@ -317,15 +825,13 @@ const AirDefenseSimulation = () => {
           x,
           y,
           t: i,
-          confidence: predictionAccuracy * (1 - i * 0.05), // Confidence decreases over time
+          confidence: predictionAccuracy * (1 - i * 0.05),
         });
       }
       return trajectory;
     },
     []
   );
-
-  // Calculate interception with success probability
   const calculateInterceptionPoint = useCallback(
     (threat: Threat, interceptorSpeed = 6): InterceptionPoint | null => {
       const dx = threat.x - RADAR_CENTER_X;
@@ -343,20 +849,16 @@ const AirDefenseSimulation = () => {
 
       const t = (-b - Math.sqrt(discriminant)) / (2 * a);
       if (t < 0) return null;
-
-      // Calculate success probability based on multiple factors
       const distance = Math.sqrt(dx * dx + dy * dy);
       const timeUntilImpact = t;
       const threatPriority = THREAT_TYPES[threat.type]?.priority || 1;
       const detectionConfidence = threat.confidence || 0.5;
 
-      let probability = 0.8; // Base success rate
-      probability *= detectionConfidence; // Higher confidence = better targeting
-      probability *= Math.max(0.3, 1 - distance / RADAR_RADIUS); // Closer = easier
-      probability *= Math.max(0.4, 1 - timeUntilImpact / 100); // More time = harder
-      probability *= threatPriority / 4; // Prioritize high-value targets
-
-      // Defense mode adjustments
+      let probability = 0.8;
+      probability *= detectionConfidence;
+      probability *= Math.max(0.3, 1 - distance / RADAR_RADIUS);
+      probability *= Math.max(0.4, 1 - timeUntilImpact / 100);
+      probability *= threatPriority / 4;
       if (defenseMode === "AGGRESSIVE") probability *= 1.2;
       else if (defenseMode === "DEFENSIVE") probability *= 0.9;
 
@@ -369,8 +871,6 @@ const AirDefenseSimulation = () => {
     },
     [defenseMode]
   );
-
-  // Enhanced AI decision making with adaptive learning
   const prioritizeThreats = useCallback((threats: Threat[]): Threat[] => {
     return threats
       .map((threat) => {
@@ -378,30 +878,14 @@ const AirDefenseSimulation = () => {
           Math.pow(threat.x - RADAR_CENTER_X, 2) +
             Math.pow(threat.y - RADAR_CENTER_Y, 2)
         );
-
-        // Calculate estimated impact time
         const speed = Math.sqrt(threat.vx * threat.vx + threat.vy * threat.vy);
         const estimatedImpactTime = distance / speed;
-
-        // Enhanced threat scoring algorithm
         let threatScore = 0;
-
-        // Base priority from type
         threatScore += (THREAT_TYPES[threat.type]?.priority || 1) * 25;
-
-        // Distance factor (closer = more dangerous)
         threatScore += (1 - distance / RADAR_RADIUS) * 30;
-
-        // Speed factor
         threatScore += Math.min(speed / 6, 1) * 20;
-
-        // Confidence factor
         threatScore += (threat.confidence || 0.5) * 15;
-
-        // Time criticality
         threatScore += Math.max(0, 100 - estimatedImpactTime) * 0.5;
-
-        // Threat level multiplier
         const levelMultiplier = {
           LOW: 1,
           MEDIUM: 1.5,
@@ -418,8 +902,6 @@ const AirDefenseSimulation = () => {
       })
       .sort((a, b) => (b.priority || 0) - (a.priority || 0));
   }, []);
-
-  // Enhanced threat creation with realistic patterns
   const createThreat = useCallback((): Threat => {
     const patterns = ["random", "coordinated", "stealth_approach", "swarm"];
     const pattern = patterns[Math.floor(Math.random() * patterns.length)];
@@ -428,7 +910,7 @@ const AirDefenseSimulation = () => {
 
     switch (pattern) {
       case "coordinated": {
-        angle = Math.PI / 4 + (Math.random() * Math.PI) / 2; // From one sector
+        angle = Math.PI / 4 + (Math.random() * Math.PI) / 2;
         spawnDistance = RADAR_RADIUS + 50 + Math.random() * 50;
         speed = 2 + Math.random() * 3;
         targetAngle = Math.atan2(
@@ -440,15 +922,15 @@ const AirDefenseSimulation = () => {
 
       case "stealth_approach": {
         angle = Math.random() * 2 * Math.PI;
-        spawnDistance = RADAR_RADIUS + 100; // Further away
-        speed = 1.5 + Math.random() * 2; // Slower
+        spawnDistance = RADAR_RADIUS + 100;
+        speed = 1.5 + Math.random() * 2;
         targetAngle = Math.random() * 2 * Math.PI;
         break;
       }
 
       case "swarm": {
         const swarmCenter = Math.random() * 2 * Math.PI;
-        angle = swarmCenter + (Math.random() - 0.5) * 0.5; // Clustered
+        angle = swarmCenter + (Math.random() - 0.5) * 0.5;
         spawnDistance = RADAR_RADIUS + 30;
         speed = 2 + Math.random() * 2;
         targetAngle = Math.random() * 2 * Math.PI;
@@ -456,7 +938,6 @@ const AirDefenseSimulation = () => {
       }
 
       default: {
-        // random
         angle = Math.random() * 2 * Math.PI;
         spawnDistance = RADAR_RADIUS + 50;
         speed = 1 + Math.random() * 4;
@@ -479,16 +960,20 @@ const AirDefenseSimulation = () => {
       type: "UNKNOWN",
       behaviorPattern: pattern,
     };
-
-    const classification = classifyThreat(threat);
-    threat.type = classification.type;
-    threat.confidence = classification.confidence;
-    threat.threatLevel = classification.threatLevel;
+    if (aiEnabled && aiModels.threatClassifier) {
+      const classification = classifyThreat(threat);
+      threat.type = classification.type;
+      threat.confidence = classification.confidence;
+      threat.threatLevel = classification.threatLevel;
+    } else {
+      const classification = classifyThreat(threat);
+      threat.type = classification.type;
+      threat.confidence = classification.confidence;
+      threat.threatLevel = classification.threatLevel;
+    }
 
     return threat;
   }, [classifyThreat]);
-
-  // Enhanced interceptor launch with intelligent targeting
   const launchInterceptor = useCallback(
     (threat: Threat): Interceptor | null => {
       const interceptionPoint = calculateInterceptionPoint(threat);
@@ -498,7 +983,7 @@ const AirDefenseSimulation = () => {
       const dx = interceptionPoint.x - RADAR_CENTER_X;
       const dy = interceptionPoint.y - RADAR_CENTER_Y;
       const distance = Math.sqrt(dx * dx + dy * dy);
-      const speed = 6 + (threat.threatLevel === "CRITICAL" ? 2 : 0); // Faster for critical threats
+      const speed = 6 + (threat.threatLevel === "CRITICAL" ? 2 : 0);
 
       return {
         id: Date.now() + Math.random(),
@@ -517,12 +1002,10 @@ const AirDefenseSimulation = () => {
     },
     [calculateInterceptionPoint]
   );
-
-  // Enhanced radar detection with adaptive sensitivity
   const detectThreats = useCallback(
     (threats: Threat[], radarAngle: number): Threat[] => {
       const detectionRange = RADAR_RADIUS * radarSensitivity;
-      const detectionAngle = Math.PI / 8; // Narrower, more realistic cone
+      const detectionAngle = Math.PI / 8;
 
       return threats.map((threat) => {
         const dx = threat.x - RADAR_CENTER_X;
@@ -535,29 +1018,19 @@ const AirDefenseSimulation = () => {
 
         const inRange = distance <= detectionRange;
         const inAngle = angleDiff <= detectionAngle;
-
-        // Adaptive detection probability based on threat type and conditions
         const threatConfig = THREAT_TYPES[threat.type] || THREAT_TYPES.UNKNOWN;
-        let detectionProbability = 0.1; // Base false positive rate
+        let detectionProbability = 0.1;
 
         if (inRange && inAngle) {
           detectionProbability = threatConfig.detectability * radarSensitivity;
-
-          // Distance affects detection
           detectionProbability *= 1 - (distance / detectionRange) * 0.5;
-
-          // Size affects detection
           detectionProbability *= Math.min(1.5, threat.size / 5);
-
-          // Weather simulation (random interference)
           detectionProbability *= 0.8 + Math.random() * 0.4;
         }
 
         if (!threat.detected && Math.random() < detectionProbability) {
           threat.detected = true;
           threat.detectedAt = Date.now();
-
-          // Add detection alert for new threats
           if (
             threat.threatLevel === "CRITICAL" ||
             threat.threatLevel === "HIGH"
@@ -580,8 +1053,6 @@ const AirDefenseSimulation = () => {
     },
     [radarSensitivity, addAlert]
   );
-
-  // Remove expired alerts
   useEffect(() => {
     const interval = setInterval(() => {
       setAlerts((prev) =>
@@ -591,8 +1062,6 @@ const AirDefenseSimulation = () => {
 
     return () => clearInterval(interval);
   }, []);
-
-  // Update system metrics
   useEffect(() => {
     const interval = setInterval(() => {
       setSystemMetrics((prev) => ({
@@ -603,8 +1072,17 @@ const AirDefenseSimulation = () => {
 
     return () => clearInterval(interval);
   }, []);
+  useEffect(() => {
+    if (!aiEnabled) return;
 
-  // Add explosion effect
+    const trainingInterval = setInterval(() => {
+      if (trainingData.threatFeatures.length >= 20) {
+        trainAIModels();
+      }
+    }, 30000);
+
+    return () => clearInterval(trainingInterval);
+  }, [aiEnabled, trainingData.threatFeatures.length, trainAIModels]);
   const createExplosion = useCallback(
     (x: number, y: number, success: boolean) => {
       const explosion: Explosion = {
@@ -620,8 +1098,6 @@ const AirDefenseSimulation = () => {
     },
     []
   );
-
-  // Check for interceptions
   const checkInterceptions = useCallback(() => {
     setInterceptors((prevInterceptors) => {
       const updatedInterceptors = [...prevInterceptors];
@@ -640,69 +1116,52 @@ const AirDefenseSimulation = () => {
 
           const threat = updatedThreats[threatIndex];
           if (threat.destroyed) return;
-
-          // Calculate distance between interceptor and threat
           const distance = Math.sqrt(
             Math.pow(interceptor.x - threat.x, 2) +
               Math.pow(interceptor.y - threat.y, 2)
           );
 
           if (distance < INTERCEPTION_DISTANCE) {
-            // Successful interception
             const successChance = interceptor.successProbability || 0.5;
             const isSuccess = Math.random() < successChance;
 
             if (isSuccess) {
-              // Destroy threat
               updatedThreats[threatIndex] = {
                 ...threat,
                 destroyed: true,
                 destroyedAt: Date.now(),
               };
-
-              // Mark interceptor as successful
               updatedInterceptors[interceptorIndex] = {
                 ...interceptor,
                 status: "IMPACT",
                 hasHitTarget: true,
               };
-
-              // Create explosion effect
               createExplosion(threat.x, threat.y, true);
-
-              // Add success alert
               addAlert(
                 "TARGET_DESTROYED",
-                `${threat.type} уничтожен! Вероятность попадания: ${Math.round(
+                `${threat.type} destroyed! Hit probability: ${Math.round(
                   successChance * 100
                 )}%`,
                 "MEDIUM"
               );
-
-              // Update metrics
+              collectTrainingData(threat, interceptor, true);
               setSystemMetrics((prev) => ({
                 ...prev,
                 successfulInterceptions: prev.successfulInterceptions + 1,
                 destroyedThreats: prev.destroyedThreats + 1,
               }));
             } else {
-              // Failed interception
               updatedInterceptors[interceptorIndex] = {
                 ...interceptor,
                 status: "DESTROYED",
               };
-
-              // Create failed explosion
               createExplosion(interceptor.x, interceptor.y, false);
-
-              // Add failure alert
               addAlert(
                 "TARGET_MISSED",
-                `Промах! ${threat.type} избежал перехвата`,
+                `Miss! ${threat.type} evaded interception`,
                 "HIGH"
               );
-
-              // Update metrics
+              collectTrainingData(threat, interceptor, false);
               setSystemMetrics((prev) => ({
                 ...prev,
                 missedTargets: prev.missedTargets + 1,
@@ -717,8 +1176,6 @@ const AirDefenseSimulation = () => {
       return updatedInterceptors;
     });
   }, [createExplosion, addAlert]);
-
-  // Main simulation loop with enhanced logic
   const updateSimulation = useCallback(() => {
     const currentTime = performance.now();
     if (currentTime - lastUpdateTime.current < FRAME_TIME) {
@@ -728,20 +1185,14 @@ const AirDefenseSimulation = () => {
 
     setDetectedThreats((prevThreats) => {
       let threats = [...prevThreats];
-
-      // Adaptive threat spawning based on defense mode
       let spawnRate = THREAT_SPAWN_RATE;
       if (defenseMode === "AGGRESSIVE") spawnRate *= 1.5;
       else if (defenseMode === "DEFENSIVE") spawnRate *= 0.7;
-
-      // Spawn new threats with enhanced patterns
       if (threats.length < MAX_THREATS && Math.random() < spawnRate) {
         threats.push(createThreat());
       }
-
-      // Update threat positions and properties
       threats = threats.map((threat) => {
-        if (threat.destroyed) return threat; // Don't move destroyed threats
+        if (threat.destroyed) return threat;
 
         const updatedThreat = {
           ...threat,
@@ -750,8 +1201,6 @@ const AirDefenseSimulation = () => {
           age: threat.age + 1,
           lastPosition: { x: threat.x, y: threat.y },
         };
-
-        // Update prediction accuracy over time
         if (threat.detected) {
           updatedThreat.predictionAccuracy = Math.min(
             0.95,
@@ -761,8 +1210,6 @@ const AirDefenseSimulation = () => {
 
         return updatedThreat;
       });
-
-      // Check for threats that escaped (reached center or left radar range)
       threats = threats.map((threat) => {
         if (threat.destroyed || threat.missedTarget) return threat;
 
@@ -770,15 +1217,12 @@ const AirDefenseSimulation = () => {
           Math.pow(threat.x - RADAR_CENTER_X, 2) +
             Math.pow(threat.y - RADAR_CENTER_Y, 2)
         );
-
-        // Mark as escaped if too close to center or too far from radar
         if (
           distanceFromCenter < 20 ||
           distanceFromCenter > RADAR_RADIUS + 200 ||
           threat.age > 600
         ) {
           if (!threat.intercepted && threat.detected) {
-            // This is an escaped threat
             setSystemMetrics((prev) => ({
               ...prev,
               escapedThreats: prev.escapedThreats + 1,
@@ -787,7 +1231,7 @@ const AirDefenseSimulation = () => {
             if (distanceFromCenter < 20) {
               addAlert(
                 "TARGET_MISSED",
-                `${threat.type} достиг цели! Система ПВО не смогла его остановить`,
+                `${threat.type} reached target! Air defense system failed to stop it`,
                 "CRITICAL"
               );
             }
@@ -801,29 +1245,23 @@ const AirDefenseSimulation = () => {
 
         return threat;
       });
-
-      // Remove old destroyed threats and escaped threats
       threats = threats.filter((threat) => {
         if (
           threat.destroyed &&
           threat.destroyedAt &&
           Date.now() - threat.destroyedAt > 3000
         ) {
-          return false; // Remove after 3 seconds
+          return false;
         }
         if (threat.missedTarget && threat.age > 100) {
-          return false; // Remove escaped threats after some time
+          return false;
         }
         return true;
       });
-
-      // Detect threats with enhanced radar
       threats = detectThreats(threats, radarSweep);
 
       return threats;
     });
-
-    // Update interceptors with enhanced tracking
     setInterceptors((prevInterceptors) => {
       return prevInterceptors
         .map((interceptor) => {
@@ -831,7 +1269,7 @@ const AirDefenseSimulation = () => {
             interceptor.status === "IMPACT" ||
             interceptor.status === "DESTROYED"
           ) {
-            return interceptor; // Don't move destroyed/impact interceptors
+            return interceptor;
           }
 
           const updatedInterceptor = {
@@ -840,8 +1278,6 @@ const AirDefenseSimulation = () => {
             y: interceptor.y + interceptor.vy,
             fuel: Math.max(0, (interceptor.fuel || 100) - 0.5),
           };
-
-          // Update interceptor status
           const distanceToTarget = Math.sqrt(
             Math.pow(updatedInterceptor.x - updatedInterceptor.targetX, 2) +
               Math.pow(updatedInterceptor.y - updatedInterceptor.targetY, 2)
@@ -854,7 +1290,6 @@ const AirDefenseSimulation = () => {
           return updatedInterceptor;
         })
         .filter((interceptor) => {
-          // Remove interceptors that are out of fuel or too far
           if ((interceptor.fuel || 0) <= 0) return false;
           if (interceptor.status === "DESTROYED") return false;
 
@@ -865,8 +1300,6 @@ const AirDefenseSimulation = () => {
           return distance < RADAR_RADIUS + 150;
         });
     });
-
-    // Update explosions
     setExplosions((prev) =>
       prev
         .map((explosion) => ({
@@ -876,11 +1309,7 @@ const AirDefenseSimulation = () => {
         }))
         .filter((explosion) => explosion.age < explosion.maxAge)
     );
-
-    // Check for interceptions
     checkInterceptions();
-
-    // Adaptive radar sweep speed based on threat density
     const threatDensity = detectedThreats.filter((t) => t.detected).length;
     const adaptiveSpeed = 0.03 + threatDensity * 0.01;
     setRadarSweep((prev) => (prev + adaptiveSpeed) % (2 * Math.PI));
@@ -892,8 +1321,6 @@ const AirDefenseSimulation = () => {
     detectedThreats,
     checkInterceptions,
   ]);
-
-  // Memoized statistics with enhanced metrics
   const threatStats = useMemo(
     () => ({
       total: detectedThreats.length,
@@ -920,8 +1347,6 @@ const AirDefenseSimulation = () => {
       6
     );
   }, [detectedThreats, prioritizeThreats]);
-
-  // Auto-launch interceptors based on enhanced AI decisions
   useEffect(() => {
     if (!isRunning) return;
 
@@ -929,8 +1354,6 @@ const AirDefenseSimulation = () => {
       (t) => t.detected && !t.intercepted
     );
     const prioritized = prioritizeThreats(detectedAndTracked);
-
-    // Enhanced launch logic based on threat level and system mode
     const maxInterceptors =
       defenseMode === "AGGRESSIVE" ? 4 : defenseMode === "DEFENSIVE" ? 2 : 3;
     const activeInterceptors = interceptors.filter(
@@ -941,8 +1364,6 @@ const AirDefenseSimulation = () => {
       .slice(0, maxInterceptors - activeInterceptors)
       .forEach((threat) => {
         const hasInterceptor = interceptors.some((i) => i.target === threat.id);
-
-        // Launch probability based on threat level and defense mode
         let launchProbability = 0.3;
         if (threat.threatLevel === "CRITICAL") launchProbability = 0.8;
         else if (threat.threatLevel === "HIGH") launchProbability = 0.6;
@@ -953,20 +1374,53 @@ const AirDefenseSimulation = () => {
         if (!hasInterceptor && Math.random() < launchProbability) {
           const interceptor = launchInterceptor(threat);
           if (interceptor) {
-            setInterceptors((prev) => [...prev, interceptor]);
-            setDetectedThreats((prev) =>
-              prev.map((t) =>
-                t.id === threat.id ? { ...t, intercepted: true } : t
-              )
-            );
+            if (defenseMode === "AI_AUTONOMOUS" && aiEnabled) {
+              makeInterceptionDecisionWithAI(threat, interceptor).then(
+                (decision) => {
+                  if (decision.decision === "LAUNCH") {
+                    setInterceptors((prev) => [
+                      ...prev,
+                      {
+                        ...interceptor,
+                        aiDecision: {
+                          confidence: decision.confidence,
+                          reasoning: decision.reasoning,
+                          optimalLaunchTime: Date.now(),
+                        },
+                      },
+                    ]);
+                    setDetectedThreats((prev) =>
+                      prev.map((t) =>
+                        t.id === threat.id ? { ...t, intercepted: true } : t
+                      )
+                    );
 
-            addAlert(
-              "INTERCEPTION",
-              `Interceptor launched against ${threat.type} (${Math.round(
-                (interceptor.successProbability || 0) * 100
-              )}% success rate)`,
-              threat.threatLevel || "MEDIUM"
-            );
+                    addAlert(
+                      "INTERCEPTION",
+                      `AI Interceptor launched: ${
+                        decision.reasoning
+                      } (${Math.round(decision.confidence * 100)}% confidence)`,
+                      threat.threatLevel || "MEDIUM"
+                    );
+                  }
+                }
+              );
+            } else {
+              setInterceptors((prev) => [...prev, interceptor]);
+              setDetectedThreats((prev) =>
+                prev.map((t) =>
+                  t.id === threat.id ? { ...t, intercepted: true } : t
+                )
+              );
+
+              addAlert(
+                "INTERCEPTION",
+                `Interceptor launched against ${threat.type} (${Math.round(
+                  (interceptor.successProbability || 0) * 100
+                )}% success rate)`,
+                threat.threatLevel || "MEDIUM"
+              );
+            }
           }
         }
       });
@@ -979,8 +1433,6 @@ const AirDefenseSimulation = () => {
     defenseMode,
     addAlert,
   ]);
-
-  // Animation loop with better control
   useEffect(() => {
     if (isRunning) {
       const animate = () => {
@@ -1004,8 +1456,6 @@ const AirDefenseSimulation = () => {
       }
     };
   }, [isRunning, updateSimulation]);
-
-  // Enhanced canvas drawing with advanced visualizations
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -1014,8 +1464,6 @@ const AirDefenseSimulation = () => {
     if (!ctx) return;
 
     ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-
-    // Draw enhanced radar circles with gradient
     const gradient = ctx.createRadialGradient(
       RADAR_CENTER_X,
       RADAR_CENTER_Y,
@@ -1028,8 +1476,6 @@ const AirDefenseSimulation = () => {
     gradient.addColorStop(1, "rgba(0, 255, 0, 0.02)");
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-
-    // Draw radar range circles
     ctx.strokeStyle = "#00ff00";
     ctx.lineWidth = 1;
     for (let r = 50; r <= RADAR_RADIUS; r += 50) {
@@ -1039,8 +1485,6 @@ const AirDefenseSimulation = () => {
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-
-    // Enhanced radar sweep with dynamic intensity
     const sweepIntensity = Math.min(1, 0.5 + threatStats.detected * 0.1);
     ctx.strokeStyle = `rgba(0, 255, 0, ${sweepIntensity * 0.8})`;
     ctx.lineWidth = 3;
@@ -1051,8 +1495,6 @@ const AirDefenseSimulation = () => {
       RADAR_CENTER_Y + Math.sin(radarSweep) * RADAR_RADIUS
     );
     ctx.stroke();
-
-    // Enhanced detection cone with threat-level coloring
     const coneColor =
       threatStats.critical > 0
         ? "rgba(255, 0, 0, 0.2)"
@@ -1071,13 +1513,10 @@ const AirDefenseSimulation = () => {
     );
     ctx.closePath();
     ctx.fill();
-
-    // Draw threats with enhanced visualization
     detectedThreats.forEach((threat) => {
       const threatConfig = THREAT_TYPES[threat.type] || THREAT_TYPES.UNKNOWN;
 
       if (threat.detected) {
-        // Draw threat trajectory prediction with confidence visualization
         const trajectory = predictTrajectory(threat, 20);
         ctx.strokeStyle = threatConfig.color + "60";
         ctx.lineWidth = 2;
@@ -1093,8 +1532,6 @@ const AirDefenseSimulation = () => {
         });
         ctx.stroke();
         ctx.globalAlpha = 1;
-
-        // Enhanced threat visualization
         const threatRadius =
           threat.size +
           (threat.threatLevel === "CRITICAL"
@@ -1104,8 +1541,6 @@ const AirDefenseSimulation = () => {
             : threat.threatLevel === "MEDIUM"
             ? 1
             : 0);
-
-        // Threat pulsing effect for high priority
         const pulseEffect =
           threat.threatLevel === "CRITICAL" || threat.threatLevel === "HIGH"
             ? 1 + Math.sin(Date.now() * 0.01) * 0.3
@@ -1115,8 +1550,6 @@ const AirDefenseSimulation = () => {
         ctx.beginPath();
         ctx.arc(threat.x, threat.y, threatRadius * pulseEffect, 0, 2 * Math.PI);
         ctx.fill();
-
-        // Threat status ring
         if (threat.intercepted) {
           ctx.strokeStyle = "#00aaff";
           ctx.lineWidth = 2;
@@ -1124,8 +1557,6 @@ const AirDefenseSimulation = () => {
           ctx.arc(threat.x, threat.y, threatRadius + 5, 0, 2 * Math.PI);
           ctx.stroke();
         }
-
-        // Enhanced threat info display
         ctx.fillStyle = "#fff";
         ctx.font = "bold 10px monospace";
         ctx.fillText(threat.type, threat.x + 12, threat.y - 8);
@@ -1138,8 +1569,6 @@ const AirDefenseSimulation = () => {
           threat.y + 2
         );
         ctx.fillText(`P${threat.priority || 0}`, threat.x + 12, threat.y + 12);
-
-        // Threat level indicator
         const levelColor = {
           CRITICAL: "#ff0000",
           HIGH: "#ff6600",
@@ -1155,7 +1584,6 @@ const AirDefenseSimulation = () => {
           6
         );
       } else {
-        // Undetected threats (ghost visualization)
         ctx.fillStyle = "#333";
         ctx.globalAlpha = 0.3;
         ctx.beginPath();
@@ -1164,8 +1592,6 @@ const AirDefenseSimulation = () => {
         ctx.globalAlpha = 1;
       }
     });
-
-    // Enhanced interceptor visualization
     interceptors.forEach((interceptor) => {
       const statusColors = {
         LAUNCHED: "#00aaff",
@@ -1179,8 +1605,6 @@ const AirDefenseSimulation = () => {
       ctx.beginPath();
       ctx.arc(interceptor.x, interceptor.y, 4, 0, 2 * Math.PI);
       ctx.fill();
-
-      // Interceptor trail with status-based effects
       ctx.strokeStyle = statusColors[interceptor.status || "READY"] + "80";
       ctx.lineWidth = interceptor.status === "TRACKING" ? 3 : 2;
       ctx.beginPath();
@@ -1190,8 +1614,6 @@ const AirDefenseSimulation = () => {
         interceptor.y - interceptor.vy * 8
       );
       ctx.stroke();
-
-      // Success probability indicator
       if (
         interceptor.successProbability &&
         interceptor.successProbability > 0.5
@@ -1204,8 +1626,6 @@ const AirDefenseSimulation = () => {
           interceptor.y - 6
         );
       }
-
-      // Fuel indicator
       if ((interceptor.fuel || 100) < 30) {
         ctx.strokeStyle = "#ff6600";
         ctx.lineWidth = 1;
@@ -1214,14 +1634,11 @@ const AirDefenseSimulation = () => {
         ctx.stroke();
       }
     });
-
-    // Draw explosions
     explosions.forEach((explosion) => {
       const alpha = 1 - explosion.age / explosion.maxAge;
       const radius = explosion.radius;
 
       if (explosion.success) {
-        // Successful interception explosion (green/white)
         const gradient = ctx.createRadialGradient(
           explosion.x,
           explosion.y,
@@ -1238,17 +1655,14 @@ const AirDefenseSimulation = () => {
         ctx.beginPath();
         ctx.arc(explosion.x, explosion.y, radius, 0, 2 * Math.PI);
         ctx.fill();
-
-        // Draw destruction text
         if (explosion.age < 15) {
           ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
           ctx.font = "bold 12px monospace";
           ctx.textAlign = "center";
-          ctx.fillText("УНИЧТОЖЕН", explosion.x, explosion.y - radius - 5);
+          ctx.fillText("DESTROYED", explosion.x, explosion.y - radius - 5);
           ctx.textAlign = "left";
         }
       } else {
-        // Failed interception explosion (red)
         const gradient = ctx.createRadialGradient(
           explosion.x,
           explosion.y,
@@ -1265,19 +1679,15 @@ const AirDefenseSimulation = () => {
         ctx.beginPath();
         ctx.arc(explosion.x, explosion.y, radius, 0, 2 * Math.PI);
         ctx.fill();
-
-        // Draw miss text
         if (explosion.age < 10) {
           ctx.fillStyle = `rgba(255, 100, 100, ${alpha})`;
           ctx.font = "bold 10px monospace";
           ctx.textAlign = "center";
-          ctx.fillText("ПРОМАХ", explosion.x, explosion.y - radius - 3);
+          ctx.fillText("MISS", explosion.x, explosion.y - radius - 3);
           ctx.textAlign = "left";
         }
       }
     });
-
-    // Enhanced radar center with system status
     const centerColor = isRunning
       ? threatStats.critical > 0
         ? "#ff0000"
@@ -1290,8 +1700,6 @@ const AirDefenseSimulation = () => {
     ctx.beginPath();
     ctx.arc(RADAR_CENTER_X, RADAR_CENTER_Y, 6, 0, 2 * Math.PI);
     ctx.fill();
-
-    // Radar center status ring
     ctx.strokeStyle = centerColor;
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -1322,12 +1730,12 @@ const AirDefenseSimulation = () => {
       averageResponseTime: 0,
       destroyedThreats: 0,
       escapedThreats: 0,
+      aiAccuracy: 0,
+      modelTrainingCount: 0,
     });
     systemStartTime.current = Date.now();
     addAlert("SYSTEM", "System reset complete", "LOW");
   };
-
-  // Format uptime display
   const formatUptime = (ms: number) => {
     const seconds = Math.floor(ms / 1000);
     const minutes = Math.floor(seconds / 60);
@@ -1398,7 +1806,11 @@ const AirDefenseSimulation = () => {
                   value={defenseMode}
                   onChange={(e) =>
                     setDefenseMode(
-                      e.target.value as "DEFENSIVE" | "ADAPTIVE" | "AGGRESSIVE"
+                      e.target.value as
+                        | "DEFENSIVE"
+                        | "ADAPTIVE"
+                        | "AGGRESSIVE"
+                        | "AI_AUTONOMOUS"
                     )
                   }
                   className="px-3 py-1 bg-gray-800 border border-gray-600 rounded text-sm"
@@ -1406,7 +1818,27 @@ const AirDefenseSimulation = () => {
                   <option value="DEFENSIVE">Defensive</option>
                   <option value="ADAPTIVE">Adaptive</option>
                   <option value="AGGRESSIVE">Aggressive</option>
+                  <option value="AI_AUTONOMOUS">AI Autonomous</option>
                 </select>
+                <button
+                  onClick={() => setAiEnabled(!aiEnabled)}
+                  className={`px-3 py-1 rounded text-sm transition-colors ${
+                    aiEnabled
+                      ? "bg-green-600 hover:bg-green-700 text-white"
+                      : "bg-gray-600 hover:bg-gray-700 text-gray-300"
+                  }`}
+                >
+                  AI: {aiEnabled ? "ON" : "OFF"}
+                </button>
+                <button
+                  onClick={trainAIModels}
+                  disabled={
+                    !aiEnabled || trainingData.threatFeatures.length < 5
+                  }
+                  className="px-3 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm transition-colors"
+                >
+                  Train ({trainingData.threatFeatures.length})
+                </button>
                 <button
                   onClick={() => setIsRunning(!isRunning)}
                   className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 rounded transition-colors duration-200"
@@ -1477,6 +1909,8 @@ const AirDefenseSimulation = () => {
                       ? "text-red-400"
                       : defenseMode === "DEFENSIVE"
                       ? "text-blue-400"
+                      : defenseMode === "AI_AUTONOMOUS"
+                      ? "text-green-400"
                       : "text-green-400"
                   }`}
                 >
@@ -1536,7 +1970,7 @@ const AirDefenseSimulation = () => {
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-green-400">Уничтожено:</span>
+                  <span className="text-green-400">Destroyed:</span>
                   <span className="text-green-400 font-mono">
                     {threatStats.destroyed}
                   </span>
@@ -1546,13 +1980,13 @@ const AirDefenseSimulation = () => {
             <div className="mt-2 pt-2 border-t border-gray-600">
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div className="flex justify-between">
-                  <span>Промахов:</span>
+                  <span>Misses:</span>
                   <span className="text-red-400 font-mono">
                     {threatStats.escaped}
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span>Точность:</span>
+                  <span>Accuracy:</span>
                   <span className="text-green-400 font-mono">
                     {Math.round((threatStats.avgConfidence || 0) * 100)}%
                   </span>
@@ -1660,6 +2094,28 @@ const AirDefenseSimulation = () => {
                   {Math.round(((radarSweep * 180) / Math.PI) % 360)}°
                 </span>
               </div>
+              <div className="flex justify-between">
+                <span>AI Status:</span>
+                <span
+                  className={`font-mono ${
+                    aiEnabled ? "text-green-400" : "text-red-400"
+                  }`}
+                >
+                  {aiEnabled ? "ACTIVE" : "OFFLINE"}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span>AI Accuracy:</span>
+                <span className="font-mono text-blue-400">
+                  {Math.round(systemMetrics.aiAccuracy * 100)}%
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span>Training Cycles:</span>
+                <span className="font-mono text-purple-400">
+                  {systemMetrics.modelTrainingCount}
+                </span>
+              </div>
             </div>
           </div>
 
@@ -1692,11 +2148,11 @@ const AirDefenseSimulation = () => {
               </div>
               <div className="flex items-center gap-2">
                 <div className="w-3 h-3 bg-green-400 rounded-full flex-shrink-0"></div>
-                <span>Уничтоженная цель</span>
+                <span>Destroyed Target</span>
               </div>
               <div className="flex items-center gap-2">
                 <div className="w-3 h-3 bg-red-400 rounded-full flex-shrink-0"></div>
-                <span>Промах/Взрыв</span>
+                <span>Miss/Explosion</span>
               </div>
               <div className="mt-3 pt-2 border-t border-gray-600 text-xs text-gray-400">
                 <div>Defense Modes:</div>
