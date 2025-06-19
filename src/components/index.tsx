@@ -57,6 +57,8 @@ interface Threat {
   estimatedImpactTime?: number;
   destroyedAt?: number;
   missedTarget?: boolean;
+  missedAt?: number;
+  escapeTrajectory?: { x: number; y: number }[];
   aiClassification?: {
     confidence: number;
     probabilities: { [key: string]: number };
@@ -1237,9 +1239,19 @@ const AirDefenseSimulation = () => {
             }
           }
 
+          const escapeTrajectory: { x: number; y: number }[] = [];
+          for (let i = 0; i < 50; i++) {
+            escapeTrajectory.push({
+              x: threat.x + threat.vx * i,
+              y: threat.y + threat.vy * i,
+            });
+          }
+
           return {
             ...threat,
             missedTarget: true,
+            missedAt: Date.now(),
+            escapeTrajectory,
           };
         }
 
@@ -1253,7 +1265,11 @@ const AirDefenseSimulation = () => {
         ) {
           return false;
         }
-        if (threat.missedTarget && threat.age > 100) {
+        if (
+          threat.missedTarget &&
+          threat.missedAt &&
+          Date.now() - threat.missedAt > 10000
+        ) {
           return false;
         }
         return true;
